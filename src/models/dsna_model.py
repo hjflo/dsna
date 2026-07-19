@@ -70,12 +70,25 @@ class DSNAModel(nn.Module):
                 gamma_init=config.get('alpha', {}).get('gamma_init', 1.0),
             )
             self.gumbel_tau = config.get('alpha', {}).get('gumbel_tau', 1.0)
+        
+        # 状态管理 (调用者负责)
+        self._skill_states = None   # (S, B, D)
+        self._instr_hidden = None
 
     def reset_episode(self, batch_size):
-        self.encoder.reset_episode(batch_size)
+        device = next(self.parameters()).device
+        self._skill_states = self.encoder.init_skill_states(batch_size, device)
+        self._instr_hidden = self.encoder.init_instr_state()
         self.gw.reset_episode()
         if self.mode == 'dual':
             self.task_mlp.reset_episode()
+
+    def _encode(self, obs, instr_tokens):
+        """编码一帧观测，更新内部状态"""
+        instr_emb, self._instr_hidden = self.encoder.encode_instruction(
+            instr_tokens, self._instr_hidden)
+        self._skill_states = self.encoder(obs, instr_emb, self._skill_states)
+        return self._skill_states
 
     def freeze_for_phase2(self):
         """Phase 2 前冻结 Encoder, GW, AC Head"""
@@ -94,19 +107,17 @@ class DSNAModel(nn.Module):
         params += list(self.alpha_ctrl.parameters())
         return params
 
-    def forward_phase1(self, obs, instr_emb):
+    def forward_phase1(self, obs, instr_tokens):
         """Phase 1: GW-only forward"""
-        skill_h = self.encoder(obs, instr_emb)          # (S, B, 64)
-        h_s2, _ = self.gw(skill_h)                       # (B, 64)
-        action, value = self.ac_head(h_s2)               # (B,7), (B,)
+        skill_h = self._encode(obs, instr_tokens)        # (S, B, 64)
+        h_s2, _ = self.gw(skill_h)                        # (B, 64)
+        action, value = self.ac_head(h_s2)                # (B,7), (B,)
         return action, value, h_s2
 
-    def forward_phase2(self, obs, instr_emb, training=True):
+    def forward_phase2(self, obs, instr_tokens, training=True):
         """Phase 2: dual-system forward with alpha gating"""
-        B = obs.shape[0]
-
         with torch.no_grad():
-            skill_h = self.encoder(obs, instr_emb)       # (S, B, 64)
+            skill_h = self._encode(obs, instr_tokens)    # (S, B, 64)
 
         # TaskMLP → skill_logits, novelty_logit
         skill_logits, novelty_logit = self.task_mlp(skill_h)
@@ -147,10 +158,10 @@ class DSNAModel(nn.Module):
         }
         return action, value, info
 
-    def forward(self, obs, instr_emb, training=True):
+    def forward(self, obs, instr_tokens, training=True):
         if self.mode == 'gw_only':
-            action, value, _ = self.forward_phase1(obs, instr_emb)
+            action, value, _ = self.forward_phase1(obs, instr_tokens)
             return action, value
         else:
-            action, value, info = self.forward_phase2(obs, instr_emb, training)
+            action, value, info = self.forward_phase2(obs, instr_tokens, training)
             return action, value, info

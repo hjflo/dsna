@@ -42,8 +42,8 @@ class CNNWithFiLM(nn.Module):
 
 class SkillEncoder(nn.Module):
     """
-    S 路独立技能 GRU 编码器。
-    每路 GRU 维护自己的隐藏状态，从共享的视觉+指令特征中提取技能相关信息。
+    S 路独立技能 GRU 编码器。无内部状态存储——调用者负责状态管理。
+    每路 GRU 从共享的视觉+指令特征中提取技能相关信息。
     """
     def __init__(self, n_skills=8, skill_gru_dim=64, vision_dim=128, instr_dim=128, vocab_size=1000):
         super().__init__()
@@ -60,44 +60,36 @@ class SkillEncoder(nn.Module):
         self.skill_grus = nn.ModuleList([
             nn.GRUCell(input_dim, skill_gru_dim) for _ in range(n_skills)
         ])
-        self.skill_h = None  # (S, B, skill_gru_dim)
-        self.instr_hidden = None
 
-    def reset_episode(self, batch_size):
-        """每个 episode 开始时重置所有技能 GRU 状态为零"""
-        device = next(self.parameters()).device
-        self.skill_h = torch.zeros(self.n_skills, batch_size, self.skill_gru_dim,
-                                   device=device)
-        self.instr_hidden = None
+    def init_skill_states(self, batch_size, device):
+        """返回初始化的技能 GRU 状态 (调用者负责管理)"""
+        return torch.zeros(self.n_skills, batch_size, self.skill_gru_dim, device=device)
 
-    def encode_instruction(self, instr_tokens):
+    def init_instr_state(self):
+        return None
+
+    def encode_instruction(self, instr_tokens, instr_hidden=None):
         """
-        instr_tokens: (B, seq_len) Long tensor — 指令 token IDs
-        returns: (B, instr_dim) 指令嵌入
+        instr_tokens: (B, seq_len) Long tensor
+        instr_hidden: 可选的上一步隐藏状态
+        returns: instr_emb (B, instr_dim), new_hidden
         """
-        emb = self.instr_embed(instr_tokens)  # (B, seq_len, instr_dim)
-        if self.instr_hidden is None:
-            _, self.instr_hidden = self.instr_gru(emb)
-        else:
-            _, self.instr_hidden = self.instr_gru(emb, self.instr_hidden)
-        return self.instr_hidden.squeeze(0)  # (B, instr_dim)
+        emb = self.instr_embed(instr_tokens)
+        _, new_hidden = self.instr_gru(emb, instr_hidden)
+        return new_hidden.squeeze(0), new_hidden
 
-    def forward(self, obs, instr_emb):
+    def forward(self, obs, instr_emb, skill_states):
         """
         obs: (B, 7, 7, 3)
-        instr_emb: (B, instr_dim) — 预编码的指令嵌入
-        returns: skill_h (S, B, skill_gru_dim) — 所有技能 GRU 的更新后状态
+        instr_emb: (B, instr_dim)
+        skill_states: (S, B, skill_gru_dim) — 上一步的技能 GRU 状态
+        returns: new_skill_states (S, B, skill_gru_dim)
         """
-        B = obs.shape[0]
-        if self.skill_h is None or self.skill_h.shape[1] != B:
-            self.reset_episode(B)
+        v_feat = self.cnn_film(obs, instr_emb)
+        combined = torch.cat([v_feat, instr_emb], dim=-1)
 
-        v_feat = self.cnn_film(obs, instr_emb)       # (B, vision_dim)
-        combined = torch.cat([v_feat, instr_emb], dim=-1)  # (B, vision_dim+instr_dim)
-
-        new_h = []
+        new_states = []
         for i, gru in enumerate(self.skill_grus):
-            h_i = gru(combined, self.skill_h[i])     # (B, skill_gru_dim)
-            new_h.append(h_i)
-        self.skill_h = torch.stack(new_h, dim=0)      # (S, B, skill_gru_dim)
-        return self.skill_h
+            h_i = gru(combined, skill_states[i])
+            new_states.append(h_i)
+        return torch.stack(new_states, dim=0)
