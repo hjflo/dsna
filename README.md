@@ -2,68 +2,118 @@
 
 > Combining Kahneman's Fast/Slow thinking with Modular Skills and a Shared Global Workspace
 
-## Overview
+## Architecture
 
-DSNA implements a dual-system cognitive architecture for multi-task reinforcement learning on the BabyAI platform:
+```
+obs(7×7×3) + instr(text)
+        │
+        ▼
+┌──────────────────────────────────┐
+│  Encoder (冻结于Phase2)           │
+│  CNN+FiLM → 共享指令GRU           │
+│  → S=8 路技能GRU (各64维)        │
+│  → skill_h (8, B, 64)            │
+└──────────────┬───────────────────┘
+               │
+   ┌───────────┴───────────┐
+   ▼                       ▼
+┌──────────────┐    ┌──────────────┐
+│  TaskMLP      │    │  Alpha 控制器 │
+│  Concat→MLP   │    │  α = σ(-b +  │
+│  →skill_logits│    │   H + γ·nov) │
+│  →novelty_log │    └──────┬───────┘
+└──────┬───────┘           │
+       │                   │
+       ▼           task_label (Gumbel)
+┌──────────────┐           │
+│  System 1     │◄─────────┘
+│  活跃技能MHA  │    ┌──────────────┐
+│  → h_s1(B,64) │    │  System 2     │
+│  (可训练)      │    │  GW N_iter=2  │
+└───────┬───────┘    │  +加权聚合     │
+        │            │  → h_s2(B,64)  │
+        │            │  (冻结)        │
+        └─────┬──────┴───────┘
+              │  α 融合
+              ▼
+        h_t = (1-α)·h_s1 + α·h_s2
+              │
+              ▼
+     ┌────────────────┐
+     │  AC Head (冻结) │
+     │  Actor→7动作    │
+     │  Critic→价值    │
+     └────────────────┘
+```
 
-- **System 1 (Fast)**: Modular skill modules with pairwise attention — automatic, intuitive processing
-- **System 2 (Slow)**: Shared Global Workspace (GW) — deliberate, conscious reasoning
-- **Alpha Gating**: Dynamic α = σ(-b + entropy + γ·novelty) controls the balance
+| 组件 | 状态 | 说明 |
+|------|------|------|
+| Encoder | Phase1→冻结 | CNN+FiLM+指令GRU + **8路独立技能GRU** (各64维) |
+| System 2 (GW) | Phase1→冻结 | N_iter=2 写入, 4槽位, Top-k竞争, 加权聚合 |
+| AC Head | Phase1→冻结 | Actor(h_t)→7 + Critic(h_t)→1 |
+| TaskMLP | **Phase2可训练** | Concat 8×64 → slow_base → fast → (skill_logits, novelty_logit) |
+| System 1 | **Phase2可训练** | 活跃技能 MHA (4头), key_padding_mask 排除非活跃 |
+| Alpha (b,γ) | **Phase2可训练** | `α = σ(-b + entropy + γ·novelty)` |
 
-As experience accumulates, knowledge crystallizes from System 2 into System 1 via Reptile meta-learning.
+**单步数据流**: `encoder → task_mlp → α, task_label → s1(活跃MHA) + s2(GW) → α融合 → ac_head`
 
-## Documentation
+## Training
 
-| 文档 | 内容 |
-|------|------|
-| [architecture.md](docs/architecture.md) | 完整架构设计与训练流程 |
-| [environment.md](docs/environment.md) | BabyAI 环境说明 |
-| [dsna_project_plan.md](docs/dsna_project_plan.md) | 详细项目计划 |
+### Phase 1: GW Pre-training (current)
 
+```bash
+python scripts/train_phase1.py --episodes 50000 --save_every 5000
+# 后台: nohup python scripts/train_phase1.py ... > outputs/phase1/train.log 2>&1 &
+```
+
+| 项目 | 值 |
+|------|-----|
+| 训练组件 | Encoder + GW + AC Head |
+| 损失 | `L_ppo` (无 Alpha 惩罚) |
+| 方法 | 累积 rollout(20步) → 单次 backward |
+| 环境 | 4并行 × 8关卡均匀采样 |
+| 关键超参 | lr=1e-4, γ=0.99, clip=0.2, ent_coef=0.01 |
+
+### Phase 2: Reptile Meta-Learning
+
+```bash
+python scripts/train_phase2.py --phase1_ckpt outputs/phase1/checkpoint.pt
+```
+
+| 项目 | 值 |
+|------|-----|
+| 可训练 | TaskMLP + S1注意力 + b,γ (~40K参数) |
+| 冻结 | Encoder, GW, AC Head (~570K参数) |
+| 损失 | `L_ppo + 0.1·ReLU(α_raw)` |
+| 内循环 | K=5步 Adam(lr=0.01), 每任务重置 |
+| 外循环 | Reptile ε=0.1 更新 slow_base |
+| Fast Head | 每 episode 重置为零 |
+| 目标 | 最小化适配后α + 最大化成功率 |
 
 ## Quick Start
 
-### 1. Install
-
 ```bash
-git clone git@github.com:hjflo/dsna.git
-cd dsna_project
+git clone git@github.com:hjflo/dsna.git && cd dsna_project
 pip install -r requirements.txt
+python -m pytest tests/ -v        # 14 tests
+python scripts/train_phase1.py    # start training
 ```
 
-### 2. Test
+## Monitoring
 
 ```bash
-python -m pytest tests/ -v    # 14 unit tests
+tail -f outputs/phase1/train.log   # 实时日志
+tail outputs/phase1/log.csv        # CSV 指标
+ps -p $(pgrep -f train_phase1) -o pid,etime,%cpu,%mem  # 进程状态
 ```
 
-### 3. Phase 1: GW Pre-training (current)
+## Docs
 
-```bash
-# 前台运行
-python scripts/train_phase1.py --episodes 50000 --save_every 5000
-
-# 后台运行
-nohup python scripts/train_phase1.py --episodes 50000 --save_every 5000 > outputs/phase1/train.log 2>&1 &
-
-# 监控
-tail -f outputs/phase1/train.log
-tail outputs/phase1/log.csv
-```
-
-**训练流程**:
-1. 4 个并行 BabyAI 环境, 8 关卡随机采样
-2. 累积 rollout (20 步) → 单次 backward
-3. PPO 更新: `L = L_ppo` (无 Alpha 惩罚)
-4. 每 5000 episodes 保存 checkpoint
-
-### 4. Phase 2: Reptile Meta-Learning
-
-```bash
-python scripts/train_phase2.py \
-    --config config/default.yaml \
-    --phase1_ckpt outputs/phase1/checkpoint.pt
-```
+| 文档 | 内容 |
+|------|------|
+| [docs/architecture.md](docs/architecture.md) | 完整架构 + 数据流公式 + 训练流程 |
+| [docs/environment.md](docs/environment.md) | BabyAI obs/action/reward + 8关卡详情 |
+| [docs/dsna_project_plan.md](docs/dsna_project_plan.md) | 完整项目设计计划 |
 
 ## Project Structure
 
