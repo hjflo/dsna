@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsna"
+version = "0.1.0"
+description = "Dual-System Neural Architecture: Combining Modular Skills with a Shared Global Workspace for fast/slow reasoning"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "DSNA Team"}
+]
+keywords = ["reinforcement-learning", "cognitive-architecture", "modular-neural-networks", "global-workspace"]
+
+dependencies = [
+    "torch>=1.9.0",
+    "numpy>=1.19.0",
+    "gym>=0.21.0",
+    "gym-minigrid>=1.2.0",
+    "babyai>=1.1.0",
+    "pyyaml>=5.4.0",
+    "tensorboard>=2.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=22.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

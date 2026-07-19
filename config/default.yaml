@@ -1,0 +1,65 @@
+# DSNA Project Configuration
+
+# === Architecture ===
+model:
+  n_skills: 8               # 技能模块数量 S
+  skill_gru_dim: 64          # 每路技能 GRU 维度
+  vision_dim: 128            # CNN+FiLM 输出维度
+  instr_dim: 128             # 指令 GRU 维度
+  gw_n_slots: 4              # GW 工作空间槽位数
+  gw_top_k: 2                # GW 写入竞争 top-k
+  gw_n_write_iters: 2        # GW 写入迭代次数
+  
+  # TaskMLP
+  task_mlp_shared_dim: 256   # 共享层维度
+  task_mlp_fast_dim: 64      # 快速头部维度
+  
+  # System 1
+  s1_n_heads: 4              # Multi-Head Attention 头数
+
+  # AC Head
+  ac_hidden: 128             # Actor/Critic MLP 隐藏层
+
+# === Training ===
+training:
+  phase1:
+    total_episodes: 200000   # GW 预训练总 episode 数
+    lr: 0.0001               # Adam 学习率
+    n_envs: 64               # 并行环境数
+    rollout_steps: 40        # 每次 rollout 步数
+    ppo_epochs: 4            # PPO epoch 数
+    batch_size: 256          # Mini-batch 大小
+  
+  phase2:
+    total_meta_iters: 50000  # Reptile 元迭代数
+    lr_outer: 0.0001         # 外循环学习率
+    lr_inner: 0.01           # 内循环学习率
+    K_inner: 5               # 内循环步数
+    epsilon_meta: 0.1        # Reptile 元步长
+    tasks_per_batch: 4       # 每批元任务数
+
+# === PPO ===
+ppo:
+  clip_eps: 0.2
+  gamma: 0.99
+  gae_lambda: 0.99
+  entropy_coef: 0.01
+  value_loss_coef: 0.5
+  max_grad_norm: 0.5
+
+# === Loss ===
+loss:
+  lambda_alpha: 0.1          # GW 使用惩罚权重
+
+# === Environment ===
+env:
+  levels: ["GoToObj", "GoToRedBallGrey", "GoToRedBall", 
+           "GoToLocal", "PutNextLocal", "PickupLoc", 
+           "GoToObjMaze", "GoTo"]
+  max_steps_per_episode: 128
+
+# === Alpha Controller ===
+alpha:
+  b_init: 1.5                # 基线偏置初始值
+  gamma_init: 1.0            # novelty 权重初始值
+  gumbel_tau: 1.0            # GumbelSigmoid 温度
