@@ -64,24 +64,25 @@
 ## 三、训练流程
 
 ```
-每个 epoch:
+每个 epoch (S1和S2在同一关卡上各自采样):
   ┌─────────────────────────────────────────────┐
-  │ 1. S1 采样:                                  │
-  │    env.reset() → S1 GRU状态重置              │
-  │    for t in rollout:                         │
-  │      h_s1 = encoder(obs)  [有梯度]            │
-  │      a1 = S1_forward(h_s1)                   │
-  │      env.step(a1) → 收集 (obs,a1,r,done)     │
-  │    S1 PPO更新 (on-policy)                    │
+  │ 1. 权重同步                                  │
+  │    sync_weights(encoder_s2, encoder) [detach]│
+  │    ← S2用S1当前权重, S2不更新Encoder          │
   ├─────────────────────────────────────────────┤
-  │ 2. S2 采样:                                  │
-  │    env.reset() → S2 GRU状态重置              │
-  │    sync S2 GRU权重 ← S1 GRU权重 (detach)     │
-  │    for t in rollout:                         │
-  │      h_s2 = encoder(obs)  [detach,无梯度]     │
+  │ 2. S1 采样 (on-policy)                       │
+  │    env.reset(task_id) → S1 GRU状态重置       │
+  │    for t in rollout (20步):                   │
+  │      a1 = S1_forward(h_s1)                   │
+  │      env.step(a1) → 收集                     │
+  │    S1 PPO更新 (4 epoch, GAE λ=0.99)          │
+  ├─────────────────────────────────────────────┤
+  │ 3. S2 采样 (on-policy, 同一关卡)              │
+  │    env.reset(task_id) → S2 GRU状态重置       │
+  │    for t in rollout (20步):                   │
   │      a2 = S2_forward(h_s2)                   │
-  │      env.step(a2) → 收集 (obs,a2,r,done)     │
-  │    S2 PPO更新 (GW+AC Head only)              │
+  │      env.step(a2) → 收集                     │
+  │    S2 PPO更新 (GW+AC Head, 4 epoch)          │
   └─────────────────────────────────────────────┘
 ```
 
@@ -198,12 +199,13 @@ for ep in range(total):
 | # | 决策 | 详情 |
 |---|------|------|
 | 1 | 共享权重, 独立状态 | Encoder+Skill GRU权重共享; S1/S2各维护自己的GRU hidden state |
-| 2 | S2梯度截断 | `encoder_s2.weight = encoder.weight.detach()` — S2不更新encoder |
-| 3 | 分别采样 | S1和S2各自独立与环境交互, 各自on-policy PPO |
-| 4 | GW全竞争 | S2的GW对所有8路Skill GRU状态做竞争写入, 不依赖task_label |
-| 5 | L_sparse | `ReLU(-0.5 + entropy)` — entropy < 0.5时无惩罚, 鼓励技能集中 |
-| 6 | 无Alpha | 两系统完全独立决策, 无融合 |
-| 7 | 三阶段课程 | 0~10K简单, 10K~30K中等, 30K+困难 |
+| 2 | S2永远只读 | S2不训练Encoder/Skill GRU — 只能适应S1提供的表征, GW做高层协调 |
+| 3 | 分别采样 | S1和S2在同一关卡上各自独立与环境交互, 各自on-policy PPO |
+| 4 | PPO参数 | 4 epoch, GAE λ=0.99, rollout=20步, 4并行环境, clip=0.2 |
+| 5 | GW全竞争 | S2的GW对所有8路Skill GRU状态做竞争写入, 不依赖task_label |
+| 6 | L_sparse | `ReLU(-2.0 + entropy)` — S=8时允许约3~4个技能活跃, 强约束 |
+| 7 | 无Alpha | 两系统完全独立决策, 无融合 |
+| 8 | 三阶段课程 | 0~10K简单, 10K~30K中等, 30K+困难; 新旧关卡均匀混合, S1/S2同关卡 |
 
 ---
 
