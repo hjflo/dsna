@@ -15,6 +15,7 @@
 | 训练顺序 | 先 GW 后 S1 | **三阶段课程**: 简单→中等→困难 |
 | S1 正则 | ReLU(α_raw) 惩罚 GW 使用 | **ReLU(-b + entropy(label))** 保证技能稀疏 |
 | S2→S1 监督 | 无 | **MSE(h_s1, h_s2)** 辅助损失 |
+| Task ID | 无 | **task_id → embedding 输入 Encoder 和 TaskMLP** |
 
 ---
 
@@ -25,55 +26,46 @@
                     │       BabyAI 环境             │
                     │   8 关卡,三阶段课程            │
                     └──────────────┬──────────────┘
-                                   │ obs(7×7×3) + instr
-                    ┌──────────────┴──────────────┐
-                    │    共享 CNN+FiLM (视觉骨干)   │
-                    │    S1/S2 各复制一份,独立训练   │
-                    └──────────────┬──────────────┘
-                                   │
-          ┌────────────────────────┴────────────────────────┐
-          │                                                  │
-          ▼                                                  ▼
-┌──────────────────────┐                      ┌──────────────────────┐
-│  S1 Encoder (可训练)  │                      │  S2 Encoder (可训练)  │
-│                      │                      │                      │
-│  S1 Skill GRUs ×8    │   θ_skills ─────────→│  S2 Skill GRUs ×8    │
-│  各64维,独立隐藏状态  │   (detach copy)       │  复用S1权重,独立状态  │
-│                      │                      │                      │
-│  → h_s1 (S,B,64)     │                      │  → h_s2_raw (S,B,64) │
-└──────────┬───────────┘                      └──────────┬───────────┘
-           │                                             │
-           │  S1 更新 θ_skills                            │  S2 梯度止于此
-           │  S2 只读 θ_skills                            │  不回传至 θ_skills
-           │                                             │
-┌──────────▼───────────┐                      ┌──────────▼───────────┐
-│  S1 TaskMLP           │                      │  S2 GW                │
-│  Concat(S×64)→MLP     │                      │  N_iter=2,4槽位       │
-│  → skill_logits       │                      │  → h_s2_gw (B,64)     │
-│  → novelty_logit      │                      │                       │
-└──────────┬───────────┘                      └──────────┬───────────┘
-           │                                             │
-           │ task_label (GumbelSigmoid)                   │
-           ▼                                             │
-┌──────────▼───────────┐                                 │
-│  S1 MHA (活跃技能)    │                                 │
-│  → h_s1_out (B,64)   │                                 │
-└──────────┬───────────┘                                 │
-           │                                             │
-           │  L_aux = MSE(h_s1_out, h_s2_gw.detach())    │
-           │  ← S2 监督 S1 ←─────────────────────────────┘
-           │
-┌──────────▼───────────┐                      ┌──────────▼───────────┐
-│  S1 AC Head           │                      │  S2 AC Head           │
-│  → action_s1, value_s1│                      │  → action_s2, value_s2│
-└──────────────────────┘                      └──────────────────────┘
+                                   │ obs(7×7×3) + instr + task_id
+                    ┌──────────────┴──────────────────────────┐
+                    │   task_id → Embedding(task_id) → e_task │
+                    └──────────────┬──────────────────────────┘
+                                   │ e_task (B, 32)
+          ┌────────────────────────┼────────────────────────┐
+          │                        │                         │
+          ▼                        ▼                         ▼
+┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────┐
+│  S1 Encoder (可训练)  │  │  S2 Encoder (可训练)  │  │  S1 TaskMLP  │
+│  CNN+FiLM(obs,instr) │  │  CNN+FiLM(obs,instr) │  │              │
+│  + e_task ──────────→│  │  + e_task ──────────→│  │ Concat(      │
+│  S1 Skill GRUs ×8    │  │  S2 Skill GRUs ×8    │  │  h_s1_flat,  │
+│  → h_s1 (S,B,64)     │  │  → h_s2_raw (S,B,64)│  │  e_task      │
+└──────────┬───────────┘  └──────────┬───────────┘  │ )→MLP        │
+           │                         │               │ →skill_logits│
+           │  θ_skills ─────────────→│ (detach copy) │ →novelty_log │
+           │  S1 更新 S2 只读         │               └──────┬───────┘
+           │                         │                      │
+           ▼                         ▼                      ▼
+   ┌───────────────┐        ┌───────────────┐      task_label
+   │ S1 MHA(活跃)  │        │ S2 GW N_iter=2 │      (GumbelSigmoid)
+   │ → h_s1_out    │        │ → h_s2_gw      │          │
+   └───────┬───────┘        └───────┬───────┘          │
+           │                        │                   │
+           │   L_aux = MSE          │                   │
+           │◄───────────────────────┘                   │
+           ▼                                            │
+   ┌───────────────┐                                    │
+   │ S1 AC Head    │                                    │
+   │ + e_task ────→│                                    │
+   │ → a1, v1      │                                    │
+   └───────────────┘                                    │
+                                                        ▼
+                                                ┌───────────────┐
+                                                │ S2 AC Head    │
+                                                │ + e_task ────→│
+                                                │ → a2, v2      │
+                                                └───────────────┘
 ```
-
-### 关键设计
-
-1. **S2 复用 S1 技能参数**: S2 的 Skill GRU 权重是 S1 的 detached copy。S1 训练更新权重，S2 只读。
-2. **各自独立隐藏状态**: S1 和 S2 各有自己的 GRU 隐藏状态缓冲区。同一 episode 内各自演化。
-3. **S2 梯度隔离**: S2 loss → S2 Encoder/GW/AC Head，不穿回 S1 的 Skill GRU 权重。
 
 ---
 
@@ -81,37 +73,31 @@
 
 ```python
 # === 每个 timestep ===
+e_task = task_embedding(task_id)                     # (B, 32)
 
-# S1 forward
-h_s1 = s1_encoder(obs, instr)                    # (S,B,64) — S1 独立GRU状态
-skill_logits, novelty_logit = s1_task_mlp(h_s1)  # (B,S), (B,1)
+# S1 forward — e_task 注入 Encoder 和 TaskMLP
+h_s1 = s1_encoder(obs, instr, e_task)               # (S,B,64)
+h_s1_flat = h_s1.permute(1,0,2).reshape(B, S*64)    # (B, 512)
+skill_logits, novelty_logit = s1_task_mlp(
+    torch.cat([h_s1_flat, e_task], dim=-1))          # (B, 544) → (B,S)
 task_label = GumbelSigmoid(skill_logits)
-h_s1_out = s1_mha(h_s1, task_label)              # (B,64)
-action_s1, value_s1 = s1_ac_head(h_s1_out)
+h_s1_out = s1_mha(h_s1, task_label)                  # (B,64)
+a1, v1 = s1_ac_head(torch.cat([h_s1_out, e_task], dim=-1))
 
-# S2 forward (复用 S1 技能权重, detach)
-with torch.no_grad():
-    # S2 的 GRU 权重 = S1 的 GRU 权重 (detach copy)
-    s2_copy_weights()
-h_s2_raw = s2_encoder(obs, instr)                # (S,B,64) — S2 独立GRU状态
-h_s2_gw, _ = s2_gw(h_s2_raw)                     # (B,64)
-action_s2, value_s2 = s2_ac_head(h_s2_gw)
+# S2 forward — e_task 注入 Encoder
+sync_weights(s2_encoder.skill_grus, s1_encoder.skill_grus)  # detach
+h_s2_raw = s2_encoder(obs, instr, e_task)            # (S,B,64)
+h_s2_gw, _ = s2_gw(h_s2_raw)                         # (B,64)
+a2, v2 = s2_ac_head(torch.cat([h_s2_gw, e_task], dim=-1))
 
 # === 损失 ===
-probs = σ(skill_logits)
-entropy = -Σ p_i·log(p_i) - (1-p_i)·log(1-p_i)
+L_task_s1 = PPO(a1, v1, reward)
+L_task_s2 = PPO(a2, v2, reward)
+entropy   = -Σ p_i·log(p_i) - (1-p_i)·log(1-p_i)
+L_sparse  = ReLU(-b_sparse + entropy)
+L_aux     = MSE(h_s1_out, h_s2_gw.detach())
 
-L_task_s1 = PPO(action_s1, value_s1, reward)
-L_task_s2 = PPO(action_s2, value_s2, reward)
-L_sparse  = ReLU(-b_sparse + entropy)              # 技能稀疏正则
-L_aux     = MSE(h_s1_out, h_s2_gw.detach())        # S2→S1 辅助监督
-
-L_total = L_task_s1 + L_task_s2 
-        + λ_sparse * L_sparse 
-        + λ_aux * L_aux
-
-# S2 的 skill GRU 权重在 optimizer 外 (通过 detach copy 同步)
-```
+L_total = L_task_s1 + L_task_s2 + λ_sparse * L_sparse + λ_aux * L_aux
 
 ---
 
@@ -159,16 +145,18 @@ Stage 3: Hard (episodes N2 ~ end)
 ```python
 def train_v2():
     # 初始化
-    s1_encoder = SkillEncoder(n_skills=8)      # S1 技能 GRU (可训练)
-    s2_encoder = SkillEncoder(n_skills=8)      # S2 技能 GRU (可训练)
-    s2_encoder.load_state_dict(s1_encoder.state_dict())  # 初始同步
+    task_emb = nn.Embedding(n_levels, 32)          # task_id → (B,32)
     
-    s1_task_mlp = TaskMLP()
+    s1_encoder = SkillEncoder(n_skills=8)
+    s2_encoder = SkillEncoder(n_skills=8)
+    s2_encoder.load_state_dict(s1_encoder.state_dict())
+    
+    s1_task_mlp = TaskMLP(input_dim=8*64+32)       # 512 + 32 = 544
     s1_mha = System1MHA()
-    s1_ac = ActorCriticHead()
+    s1_ac = ActorCriticHead(input_dim=64+32)        # 64 + 32 = 96
     
     s2_gw = GlobalWorkspace()
-    s2_ac = ActorCriticHead()
+    s2_ac = ActorCriticHead(input_dim=64+32)
     
     # S1 优化器 (包含 Skill GRU 权重)
     opt_s1 = Adam([s1_encoder, s1_task_mlp, s1_mha, s1_ac])
@@ -187,18 +175,21 @@ def train_v2():
         s1_h, s2_h = zeros_states()
         
         for t in range(ep_len):
-            # S1 前向
-            h_s1 = s1_encoder(obs, instr, s1_h)
-            skill_logits, _ = s1_task_mlp(h_s1)
+            e_task = task_emb(torch.tensor([task_id]*B))  # (B,32)
+            
+            # S1 forward
+            h_s1 = s1_encoder(obs, instr, e_task, s1_h)
+            h_s1_flat = h_s1.permute(1,0,2).reshape(B, -1)
+            skill_logits, _ = s1_task_mlp(torch.cat([h_s1_flat, e_task], -1))
             task_label = gumbel_sigmoid(skill_logits)
             h_s1_out = s1_mha(h_s1, task_label)
-            a1, v1 = s1_ac(h_s1_out)
+            a1, v1 = s1_ac(torch.cat([h_s1_out, e_task], -1))
             
-            # S2 前向 (skill weights from S1, detached)
-            sync_weights(s2_encoder.skill_grus, s1_encoder.skill_grus)  # detach
-            h_s2_raw = s2_encoder(obs, instr, s2_h)
+            # S2 forward
+            sync_weights(s2_encoder.skill_grus, s1_encoder.skill_grus)
+            h_s2_raw = s2_encoder(obs, instr, e_task, s2_h)
             h_s2_gw, _ = s2_gw(h_s2_raw)
-            a2, v2 = s2_ac(h_s2_gw)
+            a2, v2 = s2_ac(torch.cat([h_s2_gw, e_task], -1))
             
             # 环境交互 (用 S2 action, S2 学得更快)
             next_obs, reward, done = env.step(a2.argmax())
