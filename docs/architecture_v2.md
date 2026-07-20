@@ -147,50 +147,90 @@ ac_s1 = ActorCriticHead(input_dim=96)
 ac_s2 = ActorCriticHead(input_dim=96)
 task_emb = nn.Embedding(n_levels, 32)
 
-b_sparse = 0.5   # 固定阈值 (max entropy ≈ 5.5 for S=8)
+b_sparse = 2.0   # 固定阈值 (max entropy ≈ 5.5 for S=8, 允许3~4技能活跃)
 λ_sparse = 0.01
+rollout_steps = 20
+n_envs = 4      # 并行环境数
+
+# encoder_s2: 独立 SkillEncoder 实例, 独立 GRU 状态
+# 每次 S2 采样前: encoder_s2.load_state_dict(encoder.state_dict()) — detach
+encoder_s2 = copy.deepcopy(encoder)
 
 opt = Adam([encoder, s1_task_mlp, s1_mha, s2_gw, ac_s1, ac_s2, task_emb], lr=1e-4)
 
 for ep in range(total):
-    task_id = sample_curriculum(ep)
+    task_id = sample_curriculum(ep)          # 按当前阶段采样关卡
     
-    # === S1 采样 ===
+    # ============================================================
+    # S1 采样 (on-policy, 有梯度到 Encoder+Skill)
+    # ============================================================
+    obs, instr = env.reset(n_envs, task_id)
+    encoder.reset_states(n_envs)
     rollout_s1 = []
-    obs, instr = env.reset(task_id)
-    encoder.reset_states()
-    for _ in range(rollout_steps):
-        e_task = task_emb(tensor([task_id]))
-        h_s1 = encoder(obs, instr, e_task)
-        a1, v1, info = s1_forward(h_s1, e_task)
-        next_obs, r, done = env.step(a1)
-        rollout_s1.append((obs, a1, r, v1, done, info))
-        obs = next_obs; if done: break
     
-    # === S2 采样 ===
-    sync_weights(encoder_s2, encoder)  # detach
+    for _ in range(rollout_steps):
+        e_task = task_emb(torch.tensor([task_id]*n_envs))
+        h_s1 = encoder(obs, instr, e_task)               # (S, B, 64)
+        
+        # TaskMLP → skill_logits + task_label (novelty_logit保留但不用)
+        h_flat = h_s1.permute(1,0,2).reshape(n_envs, -1)
+        skill_logits, _ = s1_task_mlp(torch.cat([h_flat, e_task], -1))
+        task_label = gumbel_sigmoid(skill_logits)
+        
+        # MHA (活跃技能成对交互)
+        h_s1_out = s1_mha(h_s1, task_label)
+        a1, v1 = ac_s1(torch.cat([h_s1_out, e_task], -1))
+        
+        next_obs, r, done, _ = env.step(a1.argmax(-1).tolist())
+        rollout_s1.append((obs, a1, r, v1, done, skill_logits, h_s1))
+        obs = next_obs
+    
+    # S1 PPO更新 — 存储初始GRU状态, 每epoch从初始状态重跑
+    initial_s1_states = rollout_s1[0][-1].detach().clone()  # 初始GRU状态
+    for _ in range(4):  # 4 PPO epochs
+        states = initial_s1_states.clone()
+        for (obs_t, a_t, r_t, v_t, d_t, skill_t, _) in rollout_s1:
+            h_s1 = encoder(obs_t, instr, e_task, states)  # 从保存状态继续
+            # ... recompute a1, v1 for PPO
+            # (PPO update details)
+            states = h_s1.detach()  # 每步detach截断
+    
+    # ============================================================
+    # S2 采样 (on-policy, 梯度不回传 Encoder)
+    # ============================================================
+    encoder_s2.load_state_dict(encoder.state_dict())  # sync权重(detach)
+    obs, instr = env.reset(n_envs, task_id)
+    encoder_s2.reset_states(n_envs)
     rollout_s2 = []
-    obs, instr = env.reset(task_id)
-    encoder_s2.reset_states()
+    
     for _ in range(rollout_steps):
-        e_task = task_emb(tensor([task_id]))
-        h_s2 = encoder_s2(obs, instr, e_task)
-        a2, v2 = s2_forward(h_s2, e_task)
-        next_obs, r, done = env.step(a2)
-        rollout_s2.append((obs, a2, r, v2, done))
-        obs = next_obs; if done: break
+        e_task = task_emb(torch.tensor([task_id]*n_envs))
+        h_s2 = encoder_s2(obs, instr, e_task)              # (S,B,64) 无梯度
+        h_s2_gw, _ = s2_gw(h_s2)                            # GW全8路竞争
+        a2, v2 = ac_s2(torch.cat([h_s2_gw, e_task], -1))
+        
+        next_obs, r, done, _ = env.step(a2.argmax(-1).tolist())
+        rollout_s2.append((obs, a2, r, v2, done, h_s2))
+        obs = next_obs
     
-    # === PPO 更新 ===
-    L = ppo_update(rollout_s1, ac_s1) + ppo_update(rollout_s2, ac_s2) \
-        + λ_sparse * sparse_loss(rollout_s1)
-    opt.zero_grad(); L.backward(); opt.step()
+    # S2 PPO更新 (GW+AC Head only, 4 epochs)
+    initial_s2_states = rollout_s2[0][-1].detach().clone()
+    for _ in range(4):
+        states = initial_s2_states.clone()
+        for (obs_t, a_t, r_t, v_t, d_t, _) in rollout_s2:
+            h_s2 = encoder_s2(obs_t, instr, e_task, states)
+            # ... recompute a2, v2 for PPO
+            states = h_s2.detach()
     
-    # === 评估 ===
-    if ep % 1000 == 0:
-        for level in all_levels:
-            s1_sr = evaluate(encoder, s1_forward, level)
-            s2_sr = evaluate(encoder_s2, s2_forward, level)
-            log(ep, level, s1_sr, s2_sr)
+    # ============================================================
+    # 联合损失 + 更新
+    # ============================================================
+    L_s1 = ppo_loss(rollout_s1)
+    L_s2 = ppo_loss(rollout_s2)
+    L_sparse = F.relu(-b_sparse + entropy(skill_logits_stack).mean())
+    
+    L_total = L_s1 + L_s2 + λ_sparse * L_sparse
+    opt.zero_grad(); L_total.backward(); opt.step()
 
 ---
 
@@ -201,7 +241,7 @@ for ep in range(total):
 | 1 | 共享权重, 独立状态 | Encoder+Skill GRU权重共享; S1/S2各维护自己的GRU hidden state |
 | 2 | S2永远只读 | S2不训练Encoder/Skill GRU — 只能适应S1提供的表征, GW做高层协调 |
 | 3 | 分别采样 | S1和S2在同一关卡上各自独立与环境交互, 各自on-policy PPO |
-| 4 | PPO参数 | 4 epoch, GAE λ=0.99, rollout=20步, 4并行环境, clip=0.2 |
+| 4 | PPO参数 | 4 epoch, GAE λ=0.99, rollout=20, 4并行, clip=0.2; 每epoch从初始GRU状态重跑,每步detach截断 |
 | 5 | GW全竞争 | S2的GW对所有8路Skill GRU状态做竞争写入, 不依赖task_label |
 | 6 | L_sparse | `ReLU(-2.0 + entropy)` — S=8时允许约3~4个技能活跃, 强约束 |
 | 7 | 无Alpha | 两系统完全独立决策, 无融合 |
