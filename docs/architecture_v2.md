@@ -1,6 +1,6 @@
-# DSNA v2: 联合训练 + 课程学习 + 共享编码器
+# DSNA v2: 联合训练 + 课程学习 + 共享权重
 
-> 核心: S1/S2 **联合训练**，**共享 Encoder+Skill** (S2梯度不回传)，**各自独立 AC Head**，Alpha=σ(-b+γ·KL(h_s1,h_s2)) 仅监控不融合，三阶段课程。
+> 核心: S1/S2 **联合训练**，**共享 Encoder+Skill 权重** (各自独立GRU状态)，**各自独立 AC Head**，**无 Alpha**，三阶段课程。
 
 ---
 
@@ -9,15 +9,13 @@
 | 维度 | v1 | v2 |
 |------|-----|-----|
 | 训练方式 | Phase1 GW→冻结→Phase2 S1 | **S1+S2 联合训练** |
-| Encoder+Skill | S1/S2 各自独立 | **共享一套** Encoder + Skill GRU |
-| AC Head | S1/S2 各自独立 | **S1/S2 各自独立** AC Head |
-| S2 梯度 | 无限制 | **S2 梯度不回传** Encoder/Skill (detach) |
-| GW 迭代 | N_iter=2 | **每时间步 1 次** |
-| Alpha | α=σ(-b+H+γ·novelty) | **α=σ(-b+γ·KL(h_s1,h_s2))** 仅监控 |
-| Novelty | TaskMLP 预测 | **KL(h_s1_out, h_s2_gw)** |
-| S2→S1 监督 | 无 | **无** (各自独立训练) |
-| 训练顺序 | 先GW后S1 | **三阶段课程**: 简单→中等→困难 |
+| Encoder | 共享一套 | **共享权重, 各自独立GRU状态** |
+| Skill GRU | 共享 | **共享权重, S2梯度不回传** |
+| Alpha | α=σ(-b+H+γ·novelty) | **无 Alpha — 各自独立决策** |
+| S2→S1 监督 | 无 | **无** |
 | S1 正则 | ReLU(α_raw) | **ReLU(-b+entropy)** 技能稀疏 |
+| 训练顺序 | 先GW后S1 | **三阶段课程**: 简单→中等→困难 |
+| 采样 | S2驱动环境 | **S1/S2 各自分别采样** |
 | Task ID | 无 | **Embedding→Encoder+TaskMLP+ACHead** |
 
 ---
@@ -34,95 +32,104 @@
               └───────┬───────┘
                       │
       ┌───────────────┴───────────────────────────┐
-      │   共享 Encoder (S1 可训练, S2 只读)        │
+      │   共享 Encoder 权重, 各自独立 GRU 状态     │
       │   CNN+FiLM(obs,instr) + e_task             │
       │   → S=8 路 Skill GRU (各64维)              │
-      │   → h_skills (S, B, 64)                    │
+      │                                            │
+      │   S1: h_s1 (S,B,64) — 有梯度               │
+      │   S2: h_s2 (S,B,64) — detach, 梯度不回传    │
       └───────┬───────────────────────────────────┘
               │
-              ├── S1: h_skills (有梯度, 训练 Encoder+Skill)
-              │
-              └── S2: h_skills.detach() ← 梯度截断, 不回传
-                      │
-   ┌──────────────────┴──────────────────┐
-   │  S1 (可训练)                         │  S2 (可训练: GW only)
-   │                                     │
-   │  TaskMLP:                           │  GW (1次迭代):
-   │  Concat(h_flat, e_task) → MLP       │  write(竞争) → broadcast
-   │  → skill_logits (B,S)               │  → h_s2_gw (B,64)
-   │  → task_label (GumbelSigmoid)       │
-   │                                     │  AC Head S2:
-   │  S1 MHA (活跃技能):                 │  Concat(h_s2_gw, e_task)
-   │  h_skills[active] → attention       │  → action2(7), value2(1)
-   │  → h_s1_out (B,64)                  │
-   │                                     │
-   │  AC Head S1:                        │
-   │  Concat(h_s1_out, e_task)           │
-   │  → action1(7), value1(1)            │
-   └──────────────────┬──────────────────┘
-                      │
-              ┌───────┴───────┐
-              │  Alpha (监控)  │
-              │  KL(h_s1||h_s2)│
-              │  α=σ(-b+γ·KL) │
-              │  (不参与决策)  │
-              └───────────────┘
+   ┌──────────┴──────────┐
+   │  S1                  │         │  S2
+   │                      │         │
+   │  TaskMLP:            │         │  GW (1次迭代, 全8路竞争):
+   │  Concat(h_flat,e_task)         │  write → broadcast
+   │  → skill_logits(B,S) │         │  → h_s2_gw (B,64)
+   │  → task_label        │         │
+   │  (GumbelSigmoid)     │         │  AC Head S2:
+   │                      │         │  Concat(h_s2_gw, e_task)
+   │  S1 MHA (活跃技能):  │         │  → a2(7), v2(1)
+   │  h_s1[active]→attn   │         │
+   │  → h_s1_out(B,64)    │         │
+   │                      │         │
+   │  AC Head S1:         │         │
+   │  Concat(h_s1_out,e_task)       │
+   │  → a1(7), v1(1)      │         │
+   └──────────────────────┘         └──────────────────────┘
 ```
 
 ---
 
-## 三、损失函数
+## 三、训练流程
+
+```
+每个 epoch:
+  ┌─────────────────────────────────────────────┐
+  │ 1. S1 采样:                                  │
+  │    env.reset() → S1 GRU状态重置              │
+  │    for t in rollout:                         │
+  │      h_s1 = encoder(obs)  [有梯度]            │
+  │      a1 = S1_forward(h_s1)                   │
+  │      env.step(a1) → 收集 (obs,a1,r,done)     │
+  │    S1 PPO更新 (on-policy)                    │
+  ├─────────────────────────────────────────────┤
+  │ 2. S2 采样:                                  │
+  │    env.reset() → S2 GRU状态重置              │
+  │    sync S2 GRU权重 ← S1 GRU权重 (detach)     │
+  │    for t in rollout:                         │
+  │      h_s2 = encoder(obs)  [detach,无梯度]     │
+  │      a2 = S2_forward(h_s2)                   │
+  │      env.step(a2) → 收集 (obs,a2,r,done)     │
+  │    S2 PPO更新 (GW+AC Head only)              │
+  └─────────────────────────────────────────────┘
+```
+
+---
+
+## 四、损失函数
 
 ```python
-e_task = task_emb(task_id)                        # (B, 32)
+# === S1 采样 (on-policy) ===
+for t in rollout_s1:
+    h_s1 = encoder(obs, instr, e_task)               # (S,B,64) 有梯度
+    h_flat = h_s1.permute(1,0,2).reshape(B, -1)
+    skill_logits = s1_task_mlp(torch.cat([h_flat, e_task], -1))
+    task_label = gumbel_sigmoid(skill_logits)
+    h_s1_out = s1_mha(h_s1, task_label)
+    a1, v1 = ac_head_s1(torch.cat([h_s1_out, e_task], -1))
+    # env.step(a1) → reward
 
-# === Encoder (共享) ===
-h_skills = encoder(obs, instr, e_task)            # (S, B, 64)
-
-# === S1 forward (有梯度) ===
-h_flat = h_skills.permute(1,0,2).reshape(B, -1)   # (B, 512)
-skill_logits = s1_task_mlp(torch.cat([h_flat, e_task], -1))
-task_label = gumbel_sigmoid(skill_logits)
-h_s1_out = s1_mha(h_skills, task_label)             # (B, 64)
-a1, v1 = ac_head_s1(torch.cat([h_s1_out, e_task], -1))
-
-# === S2 forward (detach, 梯度不回传 Encoder) ===
-h_s2_gw, _ = s2_gw(h_skills.detach())              # (B, 64)
-a2, v2 = ac_head_s2(torch.cat([h_s2_gw, e_task], -1))
-
-# === Alpha: KL 散度 (仅监控, 不参与损失) ===
-kl = KL_divergence(h_s1_out, h_s2_gw.detach())
-α  = σ(-b_alpha + γ * kl)                            # 仅记录
-
-# === 环境交互 (用 S2 action — S2 学得快) ===
-next_obs, reward, done = env.step(a2.argmax())
-
-# === 损失 (各自独立) ===
-L_s1 = PPO(a1, v1, reward)
-L_s2 = PPO(a2, v2, reward)
+L_s1 = PPO(a1, v1, reward_s1)
 entropy  = -Σ p_i·log(p_i) - (1-p_i)·log(1-p_i)
-L_sparse = ReLU(-b_sparse + entropy)
+L_sparse = ReLU(-b_sparse + entropy.mean())
 
+# === S2 采样 (on-policy, 权重同步) ===
+sync_weights(s2_encoder, s1_encoder)   # detach copy
+for t in rollout_s2:
+    h_s2 = s2_encoder(obs, instr, e_task)            # (S,B,64) 无梯度到S1
+    h_s2_gw, _ = s2_gw(h_s2)                          # 全8路竞争写入
+    a2, v2 = ac_head_s2(torch.cat([h_s2_gw, e_task], -1))
+    # env.step(a2) → reward
+
+L_s2 = PPO(a2, v2, reward_s2)
+
+# === 总损失 ===
 L_total = L_s1 + L_s2 + λ_sparse * L_sparse
-# 无 L_aux, 无 α 惩罚 — 两个系统独立学习
 ```
 
 ---
 
 ## 五、三阶段课程
 
+| 阶段 | Episodes | 关卡 | S2 预期 | S1 预期 |
+|------|----------|------|---------|---------|
+| **Simple** | 0 ~ 10K | GoToObj, GoToRedBall, GoToLocal | 快速收敛 | 技能缓慢特化 |
+| **Medium** | 10K ~ 30K | +PickupLoc, PutNextLocal, GoToObjMaze | 快速迁移 | 独立追赶, 不遗忘旧技能 |
+| **Hard** | 30K ~ end | +GoTo (完整Baby Language) | 处理复杂推理 | 稳定, L_sparse防过拟合 |
+
 ```
-Stage 1: Simple  (GoToObj, GoToRedBall, GoToLocal)
-  → S2 GW 快速学会, S1 技能缓慢特化
-  → KL 高 (S1≠S2) — S2 领先
-
-Stage 2: Medium  (新增 PickupLoc, PutNextLocal, GoToObjMaze)
-  → S2 快速迁移, S1 独立追赶
-  → KL 逐渐降低 (S1 逼近 S2)
-
-Stage 3: Hard    (新增 GoTo)
-  → S2 处理复杂推理, S1 保持稳定
-  → 回顾简单关卡: S1 不遗忘 (稀疏技能分配)
+评估: 每 1K episodes 在所有关卡上分别测试 S1 和 S2 的 success rate
 ```
 
 ---
@@ -130,62 +137,82 @@ Stage 3: Hard    (新增 GoTo)
 ## 六、训练算法
 
 ```python
-encoder = SkillEncoder(n_skills=8)
-s1_task_mlp = TaskMLP(input_dim=544)       # 512 + 32
+encoder = SkillEncoder(n_skills=8)             # 共享权重
+encoder_s2 = copy_encoder(encoder)              # 独立GRU状态
+s1_task_mlp = TaskMLP(input_dim=544)            # 512 + 32
 s1_mha = System1MHA()
-s2_gw = GlobalWorkspace(n_iters=1)
-ac_head_s1 = ActorCriticHead(input_dim=96)  # 64 + 32
-ac_head_s2 = ActorCriticHead(input_dim=96)  # 独立
+s2_gw = GlobalWorkspace(n_iters=1)              # 单次迭代,全8路竞争
+ac_s1 = ActorCriticHead(input_dim=96)
+ac_s2 = ActorCriticHead(input_dim=96)
 task_emb = nn.Embedding(n_levels, 32)
 
-b_alpha = nn.Parameter(torch.tensor(1.5))   # Alpha 仅监控
-gamma   = nn.Parameter(torch.tensor(1.0))
-b_sparse = 0.5
+b_sparse = 0.5   # 固定阈值 (max entropy ≈ 5.5 for S=8)
+λ_sparse = 0.01
 
-opt = Adam([encoder, s1_task_mlp, s1_mha, s2_gw,
-            ac_head_s1, ac_head_s2, task_emb, b_alpha, gamma], lr=1e-4)
+opt = Adam([encoder, s1_task_mlp, s1_mha, s2_gw, ac_s1, ac_s2, task_emb], lr=1e-4)
 
 for ep in range(total):
     task_id = sample_curriculum(ep)
-    obs, instr = env.reset(task_id)
     
-    for t in range(ep_len):
-        e_task = task_emb(torch.tensor([task_id]*B))
-        h_skills = encoder(obs, instr, e_task, states)
-        
-        # S1
-        h_flat = h_skills.permute(1,0,2).reshape(B,-1)
-        skill_logits = s1_task_mlp(torch.cat([h_flat, e_task], -1))
-        task_label = gumbel_sigmoid(skill_logits)
-        h_s1_out = s1_mha(h_skills, task_label)
-        a1, v1 = ac_head_s1(torch.cat([h_s1_out, e_task], -1))
-        
-        # S2 (detach, 梯度隔离)
-        h_s2_gw, _ = s2_gw(h_skills.detach())
-        a2, v2 = ac_head_s2(torch.cat([h_s2_gw, e_task], -1))
-        
-        # Alpha (仅监控)
-        kl = kl_div(h_s1_out, h_s2_gw.detach())
-        α  = torch.sigmoid(-b_alpha + gamma * kl)
-        
-        # 环境交互 (S2 action)
-        next_obs, reward, done = env.step(a2.argmax())
-        
-        # 损失 (各自独立)
-        L = ppo_loss(a1, v1, reward) + ppo_loss(a2, v2, reward) \
-            + λ_sparse * F.relu(-b_sparse + entropy(skill_logits))
-        
-        opt.zero_grad(); L.backward(); opt.step()
-        states = h_skills
+    # === S1 采样 ===
+    rollout_s1 = []
+    obs, instr = env.reset(task_id)
+    encoder.reset_states()
+    for _ in range(rollout_steps):
+        e_task = task_emb(tensor([task_id]))
+        h_s1 = encoder(obs, instr, e_task)
+        a1, v1, info = s1_forward(h_s1, e_task)
+        next_obs, r, done = env.step(a1)
+        rollout_s1.append((obs, a1, r, v1, done, info))
+        obs = next_obs; if done: break
+    
+    # === S2 采样 ===
+    sync_weights(encoder_s2, encoder)  # detach
+    rollout_s2 = []
+    obs, instr = env.reset(task_id)
+    encoder_s2.reset_states()
+    for _ in range(rollout_steps):
+        e_task = task_emb(tensor([task_id]))
+        h_s2 = encoder_s2(obs, instr, e_task)
+        a2, v2 = s2_forward(h_s2, e_task)
+        next_obs, r, done = env.step(a2)
+        rollout_s2.append((obs, a2, r, v2, done))
+        obs = next_obs; if done: break
+    
+    # === PPO 更新 ===
+    L = ppo_update(rollout_s1, ac_s1) + ppo_update(rollout_s2, ac_s2) \
+        + λ_sparse * sparse_loss(rollout_s1)
+    opt.zero_grad(); L.backward(); opt.step()
+    
+    # === 评估 ===
+    if ep % 1000 == 0:
+        for level in all_levels:
+            s1_sr = evaluate(encoder, s1_forward, level)
+            s2_sr = evaluate(encoder_s2, s2_forward, level)
+            log(ep, level, s1_sr, s2_sr)
 
 ---
 
-## 七、预期现象
+## 七、关键设计决策
+
+| # | 决策 | 详情 |
+|---|------|------|
+| 1 | 共享权重, 独立状态 | Encoder+Skill GRU权重共享; S1/S2各维护自己的GRU hidden state |
+| 2 | S2梯度截断 | `encoder_s2.weight = encoder.weight.detach()` — S2不更新encoder |
+| 3 | 分别采样 | S1和S2各自独立与环境交互, 各自on-policy PPO |
+| 4 | GW全竞争 | S2的GW对所有8路Skill GRU状态做竞争写入, 不依赖task_label |
+| 5 | L_sparse | `ReLU(-0.5 + entropy)` — entropy < 0.5时无惩罚, 鼓励技能集中 |
+| 6 | 无Alpha | 两系统完全独立决策, 无融合 |
+| 7 | 三阶段课程 | 0~10K简单, 10K~30K中等, 30K+困难 |
+
+---
+
+## 八、预期现象
 
 ```
-         S2 (GW)              S1 (Skill)           α (KL-based)
-Stage1:  ████████████ 快       ████░░░░░░ 慢         ████████ 高 (S1≠S2)
-Stage2:  ████████████ 迁移快   ████████░░ 追赶       ████░░░░ 中
-Stage3:  ██████████░ 复杂ok    ██████████ 稳定       ██░░░░░░ 低 (S1≈S2)
-回顾S1:  ██████████░ 轻微忘    ██████████ 不遗忘     █░░░░░░░ 很低
+         S2 (GW)              S1 (Skill)
+Stage1:  ████████████ 快收敛   ████░░░░░░ 慢特化
+Stage2:  ████████████ 快迁移   ████████░░ 追赶中
+Stage3:  ██████████░ 复杂ok    ██████████ 稳定
+回顾S1:  ██████████░ 轻微忘    ██████████ 不遗忘 ← L_sparse防过拟合
 ```
