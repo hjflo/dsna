@@ -2,7 +2,9 @@
 
 > Combining Kahneman's Fast/Slow thinking with Modular Skills and a Shared Global Workspace
 
-## Architecture
+> **v2 架构已发布**: 联合训练 + 三阶段课程 + 双编码器 → [docs/architecture_v2.md](docs/architecture_v2.md)
+
+## Architecture (v1 — 当前实现)
 
 ```
 obs(7×7×3) + instr(text)
