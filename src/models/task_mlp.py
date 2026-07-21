@@ -13,11 +13,13 @@ class TaskMLP(nn.Module):
     slow_base: 跨任务共享，Reptile 元学习训练
     fast:      每 episode 重置，快速适配当前情境
     """
-    def __init__(self, n_skills=8, skill_gru_dim=64, shared_dim=256, fast_dim=64):
+    def __init__(self, n_skills=8, skill_gru_dim=64, shared_dim=256, fast_dim=64, input_dim=None):
         super().__init__()
-        input_dim = n_skills * skill_gru_dim  # S × 64 = 512
+        if input_dim is None:
+            input_dim = n_skills * skill_gru_dim  # v1: S × 64 = 512
+        # v2: 512 + 32(task_emb) = 544
 
-        # 慢速基座 (Reptile 元学习目标)
+        # 慢速基座
         self.slow_base = nn.Sequential(
             nn.Linear(input_dim, shared_dim),
             nn.LayerNorm(shared_dim),
@@ -64,15 +66,17 @@ class TaskMLP(nn.Module):
         """克隆慢速基座参数 (用于 Reptile 元更新前保存)"""
         return {n: p.clone() for n, p in self.slow_base.named_parameters()}
 
-    def forward(self, skill_h):
+    def forward(self, x):
         """
-        skill_h: (S, B, skill_gru_dim)
+        x: (B, input_dim) — 可以是 (S,B,D) 自动展平, 或预拼接的 (B, input_dim)
         returns: skill_logits (B, S), novelty_logit (B, 1)
         """
-        S, B, D = skill_h.shape
-        h_cat = skill_h.permute(1, 0, 2).reshape(B, S * D)  # (B, S×D)
+        if x.dim() == 3:
+            # (S, B, D) → (B, S*D)
+            S, B, D = x.shape
+            x = x.permute(1, 0, 2).reshape(B, S * D)
 
-        f_slow = self.slow_base(h_cat)          # (B, shared_dim)
+        f_slow = self.slow_base(x)              # (B, shared_dim)
         f_fast = self.fast(f_slow)               # (B, fast_dim)
 
         skill_logits = self.skill_head(f_fast)   # (B, S)

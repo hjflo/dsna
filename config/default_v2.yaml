@@ -1,0 +1,51 @@
+# DSNA v2 Configuration
+
+model:
+  n_skills: 8
+  skill_gru_dim: 64
+  vision_dim: 128
+  instr_dim: 128
+  vocab_size: 1000
+  gw_n_slots: 4
+  gw_top_k: 2
+  gw_n_write_iters: 1          # v2: 单次迭代
+  task_mlp_shared_dim: 256
+  task_mlp_fast_dim: 64
+  s1_n_heads: 4
+  ac_hidden: 128
+  n_levels: 8                   # task_emb 词表大小
+  task_emb_dim: 32
+
+training:
+  total_episodes: 50000
+  n_envs: 4
+  rollout_steps: 20
+  ppo_epochs: 4
+  lr: 0.0001
+
+ppo:
+  clip_eps: 0.2
+  gamma: 0.99
+  gae_lambda: 0.99
+  entropy_coef: 0.01
+  value_loss_coef: 0.5
+  max_grad_norm: 0.5
+
+loss:
+  lambda_sparse: 0.01
+  b_sparse: 2.0
+
+curriculum:
+  stage1_end: 10000
+  stage2_end: 30000
+  stages:
+    1: [GoToObj, GoToRedBall, GoToLocal]
+    2: [GoToObj, GoToRedBall, GoToLocal, PickupLoc, PutNextLocal, GoToObjMaze]
+    3: [GoToObj, GoToRedBall, GoToLocal, PickupLoc, PutNextLocal, GoToObjMaze, GoTo]
+
+eval:
+  interval: 1000
+  episodes: 50
+
+env:
+  max_steps_per_episode: 128
