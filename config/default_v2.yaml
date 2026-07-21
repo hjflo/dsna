@@ -18,9 +18,10 @@ model:
 
 training:
   total_episodes: 50000
-  n_envs: 4
+  n_envs: 16                   # GPU: 更多并行环境
   rollout_steps: 20
   ppo_epochs: 4
+  batch_size: 1024             # GPU: 大batch
   lr: 0.0001
 
 ppo:
